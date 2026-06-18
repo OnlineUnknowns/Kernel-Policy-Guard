@@ -1,0 +1,5 @@
+config CHRONOS
+	tristate "Chronos dynamic kernel hook monitor"
+	depends on FUNCTION_TRACER && BPF_SYSCALL
+	help
+	  Dynamic fprobe/kprobe-based hook scaffolding for policy checks.

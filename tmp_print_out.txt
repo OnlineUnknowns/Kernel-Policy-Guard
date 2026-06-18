@@ -1,0 +1,728 @@
+﻿===== chronos_main.c =====
+   1: #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+   2: 
+   3: #include <linux/init.h>
+   4: #include <linux/kernel.h>
+   5: #include <linux/module.h>
+   6: #include <linux/ftrace.h>
+   7: #include <linux/kobject.h>
+   8: #include <linux/kprobes.h>
+   9: #include <linux/ptrace.h>
+  10: #include <linux/slab.h>
+  11: #include <linux/sysfs.h>
+  12: #include <linux/types.h>
+  13: #include <linux/workqueue.h>
+  14: 
+  15: MODULE_LICENSE("GPL");
+  16: MODULE_AUTHOR("Copilot");
+  17: MODULE_DESCRIPTION("Chronos dynamic hooking scaffold");
+  18: MODULE_VERSION("0.1");
+  19: 
+  20: struct chronos_policy_config {
+  21: 	bool enabled;
+  22: 	u32 threshold;
+  23: };
+  24: 
+  25: struct chronos_work_item {
+  26: 	struct work_struct work;
+  27: 	unsigned long ip;
+  28: };
+  29: 
+  30: static struct chronos_policy_config chronos_cfg = {
+  31: 	.enabled = true,
+  32: 	.threshold = 64,
+  33: };
+  34: 
+  35: static struct kobject *chronos_kobj;
+  36: static struct workqueue_struct *chronos_wq;
+  37: static struct fprobe chronos_fp = { 0 };
+  38: static struct kprobe chronos_kp = { 0 };
+  39: static DEFINE_MUTEX(chronos_lock);
+  40: static bool chronos_fprobe_registered;
+  41: static bool chronos_kprobe_registered;
+  42: 
+  43: static void chronos_policy_worker(struct work_struct *work);
+  44: 
+  45: static int chronos_verify_policy(unsigned long ip)
+  46: {
+  47: 	if (!chronos_cfg.enabled)
+  48: 		return 0;
+  49: 
+  50: 	if (chronos_cfg.threshold == 0)
+  51: 		return 0;
+  52: 
+  53: 	pr_debug("chronos: policy check for ip=%#lx threshold=%u\n",
+  54: 		 ip, chronos_cfg.threshold);
+  55: 
+  56: 	return 0;
+  57: }
+  58: 
+  59: static void chronos_policy_worker(struct work_struct *work)
+  60: {
+  61: 	struct chronos_work_item *item =
+  62: 		container_of(work, struct chronos_work_item, work);
+  63: 
+  64: 	chronos_verify_policy(item->ip);
+  65: 	kfree(item);
+  66: }
+  67: 
+  68: static int chronos_fprobe_handler(struct fprobe *fp, struct pt_regs *regs,
+  69: 				 unsigned long ip)
+  70: {
+  71: 	struct chronos_work_item *item;
+  72: 
+  73: 	if (!chronos_cfg.enabled || !regs)
+  74: 		return 0;
+  75: 
+  76: 	item = kmalloc(sizeof(*item), GFP_ATOMIC);
+  77: 	if (!item)
+  78: 		return 0;
+  79: 
+  80: 	item->ip = ip;
+  81: 	INIT_WORK(&item->work, chronos_policy_worker);
+  82: 
+  83: 	if (!queue_work(chronos_wq, &item->work)) {
+  84: 		kfree(item);
+  85: 		return 0;
+  86: 	}
+  87: 
+  88: 	return 0;
+  89: }
+  90: 
+  91: static int chronos_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
+  92: {
+  93: 	if (!chronos_cfg.enabled)
+  94: 		return 0;
+  95: 
+  96: 	chronos_verify_policy((unsigned long)p->addr);
+  97: 	return 0;
+  98: }
+  99: 
+ 100: static ssize_t chronos_config_show(struct kobject *kobj,
+ 101: 				  struct kobj_attribute *attr, char *buf)
+ 102: {
+ 103: 	ssize_t ret;
+ 104: 
+ 105: 	mutex_lock(&chronos_lock);
+ 106: 	ret = scnprintf(buf, PAGE_SIZE,
+ 107: 			 "enabled=%u\nthreshold=%u\n",
+ 108: 			 chronos_cfg.enabled ? 1 : 0,
+ 109: 			 chronos_cfg.threshold);
+ 110: 	mutex_unlock(&chronos_lock);
+ 111: 
+ 112: 	return ret;
+ 113: }
+ 114: 
+ 115: static ssize_t chronos_config_store(struct kobject *kobj,
+ 116: 				  struct kobj_attribute *attr,
+ 117: 				  const char *buf, size_t count)
+ 118: {
+ 119: 	unsigned int enabled = 0;
+ 120: 	unsigned int threshold = 0;
+ 121: 
+ 122: 	if (sscanf(buf, "enabled=%u threshold=%u", &enabled, &threshold) == 2) {
+ 123: 		mutex_lock(&chronos_lock);
+ 124: 		chronos_cfg.enabled = enabled ? true : false;
+ 125: 		chronos_cfg.threshold = threshold;
+ 126: 		mutex_unlock(&chronos_lock);
+ 127: 		return count;
+ 128: 	}
+ 129: 
+ 130: 	if (sscanf(buf, "enabled=%u", &enabled) == 1) {
+ 131: 		mutex_lock(&chronos_lock);
+ 132: 		chronos_cfg.enabled = enabled ? true : false;
+ 133: 		mutex_unlock(&chronos_lock);
+ 134: 		return count;
+ 135: 	}
+ 136: 
+ 137: 	return -EINVAL;
+ 138: }
+ 139: 
+ 140: static struct kobj_attribute chronos_cfg_attr =
+ 141: 	__ATTR(config, 0644, chronos_config_show, chronos_config_store);
+ 142: 
+ 143: static int __init chronos_init(void)
+ 144: {
+ 145: 	int ret;
+ 146: 
+ 147: 	chronos_wq = create_singlethread_workqueue("chronos_wq");
+ 148: 	if (!chronos_wq)
+ 149: 		return -ENOMEM;
+ 150: 
+ 151: 	chronos_kobj = kobject_create_and_add("chronos", kernel_kobj);
+ 152: 	if (!chronos_kobj) {
+ 153: 		ret = -ENOMEM;
+ 154: 		goto err_destroy_wq;
+ 155: 	}
+ 156: 
+ 157: 	ret = sysfs_create_file(chronos_kobj, &chronos_cfg_attr.attr);
+ 158: 	if (ret)
+ 159: 		goto err_put_kobj;
+ 160: 
+ 161: 	chronos_fp.func = "security_file_open";
+ 162: 	chronos_fp.entry_handler = chronos_fprobe_handler;
+ 163: 	ret = register_fprobe(&chronos_fp);
+ 164: 	if (!ret) {
+ 165: 		chronos_fprobe_registered = true;
+ 166: 	} else {
+ 167: 		chronos_kp.pre_handler = chronos_kprobe_pre;
+ 168: 		chronos_kp.symbol_name = "security_file_open";
+ 169: 		ret = register_kprobe(&chronos_kp);
+ 170: 		if (!ret)
+ 171: 			chronos_kprobe_registered = true;
+ 172: 		else
+ 173: 			goto err_remove_sysfs;
+ 174: 	}
+ 175: 
+ 176: 	return 0;
+ 177: 
+ 178: err_remove_sysfs:
+ 179: 	sysfs_remove_file(chronos_kobj, &chronos_cfg_attr.attr);
+ 180: err_put_kobj:
+ 181: 	kobject_put(chronos_kobj);
+ 182: err_destroy_wq:
+ 183: 	destroy_workqueue(chronos_wq);
+ 184: 	return ret;
+ 185: }
+ 186: 
+ 187: static void __exit chronos_exit(void)
+ 188: {
+ 189: 	if (chronos_fprobe_registered)
+ 190: 		unregister_fprobe(&chronos_fp);
+ 191: 
+ 192: 	if (chronos_kprobe_registered)
+ 193: 		unregister_kprobe(&chronos_kp);
+ 194: 
+ 195: 	if (chronos_wq) {
+ 196: 		flush_workqueue(chronos_wq);
+ 197: 		destroy_workqueue(chronos_wq);
+ 198: 	}
+ 199: 
+ 200: 	if (chronos_kobj) {
+ 201: 		sysfs_remove_file(chronos_kobj, &chronos_cfg_attr.attr);
+ 202: 		kobject_put(chronos_kobj);
+ 203: 	}
+ 204: }
+ 205: 
+ 206: module_init(chronos_init);
+ 207: module_exit(chronos_exit);
+
+===== src/hooks/inode_hooks.c =====
+   1: #include <linux/ftrace.h>
+   2: #include <linux/errno.h>
+   3: #include <linux/kernel.h>
+   4: #include <linux/sched.h>
+   5: #include <linux/cred.h>
+   6: #include <linux/fs.h>
+   7: #include <linux/uidgid.h>
+   8: 
+   9: #include "../../policy/store.h"
+  10: 
+  11: static int chronos_inode_fprobe_entry(struct fprobe *fp, struct pt_regs *regs,
+  12: 				      unsigned long ip)
+  13: {
+  14: 	const struct chronos_policy *policy;
+  15: 	kuid_t uid;
+  16: 
+  17: 	policy = chronos_policy_lookup();
+  18: 	if (!policy)
+  19: 		return 0;
+  20: 
+  21: 	uid = get_current_uid();
+  22: 	if (uid.val != 0)
+  23: 		return 0;
+  24: 
+  25: 	return 0;
+  26: }
+  27: 
+  28: static int chronos_inode_fprobe_exit(struct fprobe *fp, struct pt_regs *regs,
+  29: 				     unsigned long ip)
+  30: {
+  31: 	if (regs && (unsigned long)regs_return_value(regs) == 0)
+  32: 		return 0;
+  33: 
+  34: 	if (regs)
+  35: 		ftrace_override_function_return(regs, -EPERM);
+  36: 
+  37: 	return 0;
+  38: }
+  39: 
+  40: int chronos_inode_hook_register(struct fprobe *fp)
+  41: {
+  42: 	fp->entry_handler = chronos_inode_fprobe_entry;
+  43: 	fp->exit_handler = chronos_inode_fprobe_exit;
+  44: 	fp->func = "security_inode_create";
+  45: 	return register_fprobe(fp);
+  46: }
+
+===== src/hooks/ipc_hooks.c =====
+   1: #include <linux/ftrace.h>
+   2: #include <linux/errno.h>
+   3: #include <linux/kernel.h>
+   4: #include <linux/ipc.h>
+   5: #include <linux/shm.h>
+   6: #include <linux/capability.h>
+   7: #include <linux/cred.h>
+   8: #include <linux/sched.h>
+   9: 
+  10: #include "../../policy/store.h"
+  11: 
+  12: static int chronos_ipc_fprobe_entry(struct fprobe *fp, struct pt_regs *regs,
+  13: 				    unsigned long ip)
+  14: {
+  15: 	const struct chronos_policy *policy;
+  16: 	kuid_t uid;
+  17: 
+  18: 	policy = chronos_policy_lookup();
+  19: 	if (!policy)
+  20: 		return 0;
+  21: 
+  22: 	uid = get_current_uid();
+  23: 	if (uid.val == 0)
+  24: 		return 0;
+  25: 
+  26: 	if (!capable(CAP_SYS_ADMIN))
+  27: 		return -EPERM;
+  28: 
+  29: 	return 0;
+  30: }
+  31: 
+  32: static int chronos_ipc_fprobe_exit(struct fprobe *fp, struct pt_regs *regs,
+  33: 				   unsigned long ip)
+  34: {
+  35: 	if (fp->retval && regs)
+  36: 		ftrace_override_function_return(regs, fp->retval);
+  37: 
+  38: 	return 0;
+  39: }
+  40: 
+  41: int chronos_ipc_hook_register(struct fprobe *fp)
+  42: {
+  43: 	fp->entry_handler = chronos_ipc_fprobe_entry;
+  44: 	fp->exit_handler = chronos_ipc_fprobe_exit;
+  45: 	fp->func = "shmget";
+  46: 	return register_fprobe(fp);
+  47: }
+
+===== src/hooks/net_hooks.c =====
+   1: #include <linux/ftrace.h>
+   2: #include <linux/errno.h>
+   3: #include <linux/kernel.h>
+   4: #include <linux/netdevice.h>
+   5: #include <linux/skbuff.h>
+   6: #include <linux/slab.h>
+   7: #include <linux/inet.h>
+   8: #include <linux/ip.h>
+   9: #include <linux/socket.h>
+  10: #include <linux/in.h>
+  11: #include <linux/if_ether.h>
+  12: #include <linux/netfilter.h>
+  13: #include <net/inet_sock.h>
+  14: 
+  15: #include "../../policy/store.h"
+  16: 
+  17: static int chronos_net_fprobe_entry(struct fprobe *fp, struct pt_regs *regs,
+  18: 				    unsigned long ip)
+  19: {
+  20: 	struct sk_buff *skb;
+  21: 	struct inet_sock *inet;
+  22: 	__be16 dport;
+  23: 
+  24: 	skb = (struct sk_buff *)regs_get_argument(regs, 0);
+  25: 	if (!skb || !skb->sk)
+  26: 		return 0;
+  27: 
+  28: 	inet = inet_sk(skb->sk);
+  29: 	dport = ntohs(inet->inet_dport);
+  30: 
+  31: 	if (dport == 0)
+  32: 		return 0;
+  33: 
+  34: 	if (dport == 4444) {
+  35: 		fp->retval = -EPERM;
+  36: 		kfree_skb_reason(skb, SKB_DROP_REASON_NOT_SPECIFIED);
+  37: 		return 0;
+  38: 	}
+  39: 
+  40: 	return 0;
+  41: }
+  42: 
+  43: static int chronos_net_fprobe_exit(struct fprobe *fp, struct pt_regs *regs,
+  44: 				   unsigned long ip)
+  45: {
+  46: 	if (fp->retval == -EPERM && regs)
+  47: 		ftrace_override_function_return(regs, fp->retval);
+  48: 
+  49: 	return 0;
+  50: }
+  51: 
+  52: int chronos_net_hook_register(struct fprobe *fp)
+  53: {
+  54: 	fp->entry_handler = chronos_net_fprobe_entry;
+  55: 	fp->exit_handler = chronos_net_fprobe_exit;
+  56: 	fp->func = "ip_rcv_core";
+  57: 	return register_fprobe(fp);
+  58: }
+
+===== src/hooks/task_hooks.c =====
+   1: #include <linux/ftrace.h>
+   2: #include <linux/sched.h>
+   3: #include <linux/cred.h>
+   4: #include <linux/errno.h>
+   5: #include <linux/types.h>
+   6: #include <linux/kernel.h>
+   7: #include <linux/sched/task.h>
+   8: #include <linux/uidgid.h>
+   9: 
+  10: #include "../../policy/store.h"
+  11: 
+  12: static int chronos_task_fprobe_entry(struct fprobe *fp, struct pt_regs *regs,
+  13: 				     unsigned long ip)
+  14: {
+  15: 	const struct chronos_policy *policy;
+  16: 	struct task_struct *parent;
+  17: 	struct task_struct *child;
+  18: 	kuid_t uid;
+  19: 
+  20: 	policy = chronos_policy_lookup();
+  21: 	if (!policy)
+  22: 		return 0;
+  23: 
+  24: 	parent = current;
+  25: 	uid = get_task_uid(parent);
+  26: 
+  27: 	if (uid.val == 0)
+  28: 		return 0;
+  29: 
+  30: 	child = (struct task_struct *)regs_get_argument(regs, 0);
+  31: 	if (!child)
+  32: 		return 0;
+  33: 
+  34: 	task_clear_flag(child, PF_FORKNOEXEC);
+  35: 	task_clear_flag(child, PF_SUPERPRIV);
+  36: 
+  37: 	return 0;
+  38: }
+  39: 
+  40: static int chronos_task_fprobe_exit(struct fprobe *fp, struct pt_regs *regs,
+  41: 				    unsigned long ip)
+  42: {
+  43: 	return 0;
+  44: }
+  45: 
+  46: int chronos_task_hook_register(struct fprobe *fp)
+  47: {
+  48: 	fp->entry_handler = chronos_task_fprobe_entry;
+  49: 	fp->exit_handler = chronos_task_fprobe_exit;
+  50: 	fp->func = "do_fork";
+  51: 	return register_fprobe(fp);
+  52: }
+
+===== src/cluster_sync.c =====
+   1: #include <linux/init.h>
+   2: #include <linux/kernel.h>
+   3: #include <linux/module.h>
+   4: #include <linux/kthread.h>
+   5: #include <linux/net.h>
+   6: #include <linux/socket.h>
+   7: #include <linux/in.h>
+   8: #include <linux/inet.h>
+   9: #include <linux/rcupdate.h>
+  10: #include <linux/errno.h>
+  11: #include <linux/types.h>
+  12: #include <linux/slab.h>
+  13: #include <linux/wait.h>
+  14: #include <net/sock.h>
+  15: 
+  16: #include "../policy/store.h"
+  17: 
+  18: static struct socket *kernel_sock;
+  19: static struct task_struct *cluster_thread;
+  20: static struct sockaddr_in cluster_addr;
+  21: 
+  22: static int cluster_listener_thread(void *data)
+  23: {
+  24: 	struct msghdr msg = {0};
+  25: 	struct kvec iov;
+  26: 	char buf[256];
+  27: 	int ret;
+  28: 
+  29: 	while (!kthread_should_stop()) {
+  30: 		memset(buf, 0, sizeof(buf));
+  31: 		iov.iov_base = buf;
+  32: 		iov.iov_len = sizeof(buf);
+  33: 		msg.msg_name = &cluster_addr;
+  34: 		msg.msg_namelen = sizeof(cluster_addr);
+  35: 		msg.msg_flags = MSG_DONTWAIT;
+  36: 
+  37: 		ret = kernel_recvmsg(kernel_sock, &msg, &iov, 1,
+  38: 				     sizeof(buf), msg.msg_flags);
+  39: 		if (ret == -EAGAIN || ret == -EWOULDBLOCK)
+  40: 			continue;
+  41: 		if (ret < 0) {
+  42: 			if (ret == -EINTR || ret == -ERESTARTSYS)
+  43: 				continue;
+  44: 			break;
+  45: 		}
+  46: 	}
+  47: 
+  48: 	return 0;
+  49: }
+  50: 
+  51: static int __init cluster_sync_init(void)
+  52: {
+  53: 	int ret;
+  54: 
+  55: 	ret = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM,
+  56: 				      IPPROTO_UDP, &kernel_sock);
+  57: 	if (ret)
+  58: 		return ret;
+  59: 
+  60: 	cluster_thread = kthread_run(cluster_listener_thread, NULL,
+  61: 				     "chronos_cluster");
+  62: 	if (IS_ERR(cluster_thread)) {
+  63: 		ret = PTR_ERR(cluster_thread);
+  64: 		goto err_sock_release;
+  65: 	}
+  66: 
+  67: 	return 0;
+  68: 
+  69: err_sock_release:
+  70: 	sock_release(kernel_sock);
+  71: 	kernel_sock = NULL;
+  72: 	return ret;
+  73: }
+  74: 
+  75: static void __exit cluster_sync_exit(void)
+  76: {
+  77: 	if (cluster_thread) {
+  78: 		kthread_stop(cluster_thread);
+  79: 		cluster_thread = NULL;
+  80: 	}
+  81: 
+  82: 	if (kernel_sock) {
+  83: 		sock_release(kernel_sock);
+  84: 		kernel_sock = NULL;
+  85: 	}
+  86: 
+  87: 	chronos_policy_release();
+  88: }
+  89: 
+  90: module_init(cluster_sync_init);
+  91: module_exit(cluster_sync_exit);
+
+===== src/abi_handshake.c =====
+   1: #include <linux/init.h>
+   2: #include <linux/kernel.h>
+   3: #include <linux/module.h>
+   4: #include <linux/random.h>
+   5: #include <linux/sched.h>
+   6: #include <linux/timekeeping.h>
+   7: #include <linux/wait.h>
+   8: #include <linux/errno.h>
+   9: #include <linux/uaccess.h>
+  10: #include <linux/slab.h>
+  11: 
+  12: #include "../include/uapi/chronos_abi.h"
+  13: 
+  14: MODULE_LICENSE("GPL");
+  15: MODULE_AUTHOR("Copilot");
+  16: MODULE_DESCRIPTION("Chronos ABI handshake scaffold");
+  17: 
+  18: static __u64 chronos_secret_seed;
+  19: static DECLARE_WAIT_QUEUE_HEAD(chronos_waitq);
+  20: 
+  21: static inline void pack_for_userspace(struct chronos_abi_layout *src,
+  22: 				      struct chronos_abi_user_view *dst)
+  23: {
+  24: 	dst->flags = src->flags;
+  25: 	dst->token = src->token;
+  26: 	dst->slot_id = src->slot_id;
+  27: 	dst->nonce = src->nonce;
+  28: 	dst->payload_len = src->payload_len;
+  29: 	dst->reserved = src->reserved;
+  30: }
+  31: 
+  32: static inline __u64 chronos_layout_hash(void)
+  33: {
+  34: 	__u64 ts = ktime_get_ns();
+  35: 	return siphash_3u64(chronos_secret_seed ^ ts, ts, 0ULL);
+  36: }
+  37: 
+  38: static int chronos_do_layout_negotiation(struct chronos_abi_layout *layout,
+  39: 					     struct chronos_abi_user_view *view)
+  40: {
+  41: 	int retry;
+  42: 	long timeout;
+  43: 
+  44: 	for (retry = 0; retry < 3; retry++) {
+  45: 		layout->flags = CHRONOS_ABI_VERSION;
+  46: 		layout->slot_id = (u32)(chronos_layout_hash() & 0xffffffff);
+  47: 		layout->payload_len = sizeof(*layout);
+  48: 		layout->reserved = 0;
+  49: 		layout->token = chronos_layout_hash();
+  50: 		layout->nonce = chronos_layout_hash();
+  51: 
+  52: 		pack_for_userspace(layout, view);
+  53: 
+  54: 		timeout = wait_event_interruptible_timeout(
+  55: 			chronos_waitq,
+  56: 			signal_pending(current),
+  57: 			msecs_to_jiffies(500));
+  58: 
+  59: 		if (signal_pending(current))
+  60: 			continue;
+  61: 
+  62: 		if (timeout > 0)
+  63: 			return 0;
+  64: 	}
+  65: 
+  66: 	return -ETIMEDOUT;
+  67: }
+  68: 
+  69: static int __init chronos_abi_init(void)
+  70: {
+  71: 	get_random_bytes(&chronos_secret_seed, sizeof(chronos_secret_seed));
+  72: 	return 0;
+  73: }
+  74: 
+  75: static void __exit chronos_abi_exit(void)
+  76: {
+  77: }
+  78: 
+  79: module_init(chronos_abi_init);
+  80: module_exit(chronos_abi_exit);
+
+===== telemetry/audit_logger.c =====
+   1: #include <linux/init.h>
+   2: #include <linux/kernel.h>
+   3: #include <linux/module.h>
+   4: #include <linux/ring_buffer.h>
+   5: #include <linux/ktime.h>
+   6: #include <linux/types.h>
+   7: #include <linux/sysfs.h>
+   8: #include <linux/kobject.h>
+   9: #include <linux/splice.h>
+  10: #include <linux/uaccess.h>
+  11: #include <linux/fs.h>
+  12: #include <linux/slab.h>
+  13: 
+  14: #define CHRONOS_AUDIT_BUF_SIZE (1 << 16)
+  15: 
+  16: struct chronos_event {
+  17: 	__u64 timestamp;
+  18: 	__u32 hook_id;
+  19: 	__u32 uid;
+  20: };
+  21: 
+  22: static struct ring_buffer *chronos_trace_buffer;
+  23: static struct kobject *chronos_audit_kobj;
+  24: 
+  25: static ssize_t chronos_audit_read(struct file *file, char __user *buf,
+  26: 				 size_t len, loff_t *ppos)
+  27: {
+  28: 	struct ring_buffer_event *event;
+  29: 	struct chronos_event *payload;
+  30: 	size_t copied = 0;
+  31: 
+  32: 	event = ring_buffer_read_prepare(chronos_trace_buffer, *ppos);
+  33: 	if (!event)
+  34: 		return 0;
+  35: 
+  36: 	payload = ring_buffer_event_data(event);
+  37: 	copied = sizeof(*payload);
+  38: 	if (copied > len)
+  39: 		copied = len;
+  40: 
+  41: 	if (copy_to_user(buf, payload, copied)) {
+  42: 		ring_buffer_read_finish(chronos_trace_buffer, event);
+  43: 		return -EFAULT;
+  44: 	}
+  45: 
+  46: 	ring_buffer_read_finish(chronos_trace_buffer, event);
+  47: 	*ppos += copied;
+  48: 	return copied;
+  49: }
+  50: 
+  51: static int chronos_audit_open(struct inode *inode, struct file *file)
+  52: {
+  53: 	return 0;
+  54: }
+  55: 
+  56: static const struct file_operations chronos_audit_fops = {
+  57: 	.owner = THIS_MODULE,
+  58: 	.open = chronos_audit_open,
+  59: 	.read = chronos_audit_read,
+  60: };
+  61: 
+  62: static ssize_t chronos_audit_sysfs_show(struct kobject *kobj,
+  63: 					 struct kobj_attribute *attr, char *buf)
+  64: {
+  65: 	return scnprintf(buf, PAGE_SIZE, "trace_buffer=%ps\n", chronos_trace_buffer);
+  66: }
+  67: 
+  68: static struct kobj_attribute chronos_audit_attr =
+  69: 	__ATTR(trace, 0444, chronos_audit_sysfs_show, NULL);
+  70: 
+  71: int chronos_submit_audit(u32 hook_id, u32 uid)
+  72: {
+  73: 	struct ring_buffer_event *event;
+  74: 	struct chronos_event *payload;
+  75: 
+  76: 	if (!chronos_trace_buffer)
+  77: 		return -ENODEV;
+  78: 
+  79: 	event = ring_buffer_lock_reserve(chronos_trace_buffer,
+  80: 						 0, sizeof(struct chronos_event), 0);
+  81: 	if (!event)
+  82: 		return -EAGAIN;
+  83: 
+  84: 	payload = ring_buffer_event_data(event);
+  85: 	payload->timestamp = ktime_get_real_ns();
+  86: 	payload->hook_id = hook_id;
+  87: 	payload->uid = uid;
+  88: 
+  89: 	ring_buffer_unlock_commit(chronos_trace_buffer, event, 0);
+  90: 	return 0;
+  91: }
+  92: 
+  93: static int __init chronos_audit_init(void)
+  94: {
+  95: 	int ret;
+  96: 
+  97: 	chronos_trace_buffer = ring_buffer_alloc(CHRONOS_AUDIT_BUF_SIZE,
+  98: 					      RB_FL_OVERWRITE);
+  99: 	if (!chronos_trace_buffer)
+ 100: 		return -ENOMEM;
+ 101: 
+ 102: 	chronos_audit_kobj = kobject_create_and_add("chronos_audit", kernel_kobj);
+ 103: 	if (!chronos_audit_kobj) {
+ 104: 		ring_buffer_free(chronos_trace_buffer);
+ 105: 		return -ENOMEM;
+ 106: 	}
+ 107: 
+ 108: 	ret = sysfs_create_file(chronos_audit_kobj, &chronos_audit_attr.attr);
+ 109: 	if (ret) {
+ 110: 		kobject_put(chronos_audit_kobj);
+ 111: 		ring_buffer_free(chronos_trace_buffer);
+ 112: 		return ret;
+ 113: 	}
+ 114: 
+ 115: 	return 0;
+ 116: }
+ 117: 
+ 118: static void __exit chronos_audit_exit(void)
+ 119: {
+ 120: 	if (chronos_audit_kobj) {
+ 121: 		sysfs_remove_file(chronos_audit_kobj, &chronos_audit_attr.attr);
+ 122: 		kobject_put(chronos_audit_kobj);
+ 123: 	}
+ 124: 
+ 125: 	if (chronos_trace_buffer) {
+ 126: 		ring_buffer_free(chronos_trace_buffer);
+ 127: 	}
+ 128: }
+ 129: 
+ 130: module_init(chronos_audit_init);
+ 131: module_exit(chronos_audit_exit);
+

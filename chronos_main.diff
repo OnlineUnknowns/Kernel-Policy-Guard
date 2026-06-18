@@ -1,0 +1,125 @@
+--- a/chronos_main.c
+
++++ b/chronos_main.c
+
+@@ -8,6 +8,7 @@
+
+ #include <linux/kprobes.h>
+ #include <linux/ptrace.h>
+ #include <linux/slab.h>
++#include <linux/seqlock.h>
+ #include <linux/sysfs.h>
+ #include <linux/types.h>
+ #include <linux/workqueue.h>
+@@ -31,6 +32,7 @@
+
+ 	.enabled = true,
+ 	.threshold = 64,
+ };
++static seqcount_t chronos_cfg_seq = SEQCNT_ZERO(chronos_cfg_seq);
+ 
+ static struct kobject *chronos_kobj;
+ static struct workqueue_struct *chronos_wq;
+@@ -42,16 +44,31 @@
+
+ 
+ static void chronos_policy_worker(struct work_struct *work);
+ 
++static void chronos_get_config(struct chronos_policy_config *cfg)
++{
++	unsigned int seq;
++
++	do {
++		seq = read_seqcount_begin(&chronos_cfg_seq);
++		cfg->enabled = READ_ONCE(chronos_cfg.enabled);
++		cfg->threshold = READ_ONCE(chronos_cfg.threshold);
++	} while (read_seqcount_retry(&chronos_cfg_seq, seq));
++}
++
+ static int chronos_verify_policy(unsigned long ip)
+ {
+-	if (!chronos_cfg.enabled)
+-		return 0;
+-
+-	if (chronos_cfg.threshold == 0)
++	struct chronos_policy_config cfg;
++
++	chronos_get_config(&cfg);
++
++	if (!cfg.enabled)
++		return 0;
++
++	if (cfg.threshold == 0)
+ 		return 0;
+ 
+ 	pr_debug("chronos: policy check for ip=%#lx threshold=%u\n",
+-		 ip, chronos_cfg.threshold);
++		 ip, cfg.threshold);
+ 
+ 	return 0;
+ }
+@@ -70,7 +87,7 @@
+
+ {
+ 	struct chronos_work_item *item;
+ 
+-	if (!chronos_cfg.enabled || !regs)
++	if (!READ_ONCE(chronos_cfg.enabled) || !regs)
+ 		return 0;
+ 
+ 	item = kmalloc(sizeof(*item), GFP_ATOMIC);
+@@ -90,7 +107,11 @@
+
+ 
+ static int chronos_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
+ {
+-	if (!chronos_cfg.enabled)
++	struct chronos_policy_config cfg;
++
++	chronos_get_config(&cfg);
++
++	if (!cfg.enabled)
+ 		return 0;
+ 
+ 	chronos_verify_policy((unsigned long)p->addr);
+@@ -98,7 +119,7 @@
+
+ }
+ 
+ static ssize_t chronos_config_show(struct kobject *kobj,
+-			  struct kobj_attribute *attr, char *buf)
++				  struct kobj_attribute *attr, char *buf)
+ {
+ 	ssize_t ret;
+ 
+@@ -113,23 +134,27 @@
+
+ }
+ 
+ static ssize_t chronos_config_store(struct kobject *kobj,
+-			  struct kobj_attribute *attr,
+-			  const char *buf, size_t count)
++				  struct kobj_attribute *attr,
++				  const char *buf, size_t count)
+ {
+ 	unsigned int enabled = 0;
+ 	unsigned int threshold = 0;
+ 
+ 	if (sscanf(buf, "enabled=%u threshold=%u", &enabled, &threshold) == 2) {
+ 		mutex_lock(&chronos_lock);
++		write_seqcount_begin(&chronos_cfg_seq);
+ 		chronos_cfg.enabled = enabled ? true : false;
+ 		chronos_cfg.threshold = threshold;
++		write_seqcount_end(&chronos_cfg_seq);
+ 		mutex_unlock(&chronos_lock);
+ 		return count;
+ 	}
+ 
+ 	if (sscanf(buf, "enabled=%u", &enabled) == 1) {
+ 		mutex_lock(&chronos_lock);
++		write_seqcount_begin(&chronos_cfg_seq);
+ 		chronos_cfg.enabled = enabled ? true : false;
++		write_seqcount_end(&chronos_cfg_seq);
+ 		mutex_unlock(&chronos_lock);
+ 		return count;
+ 	}
