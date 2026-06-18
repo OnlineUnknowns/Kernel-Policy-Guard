@@ -1,7 +1,7 @@
 
 <div align="center">
 
-<img src="https://capsule-render.vercel.app/api?type=venom&height=220&text=Kernel Policy Guard&fontSize=45&color=0:000000,100:0F172A&fontColor=00FF41&stroke=00FF41&strokeWidth=1&animation=twinkling" width="100%"/>
+<img src="https://capsule-render.vercel.app/api?type=venom&height=220&text=Kernel-Policy-Guard&fontSize=45&color=0:000000,100:0F172A&fontColor=00FF41&stroke=00FF41&strokeWidth=1&animation=twinkling" width="100%"/>
 
 <img src="https://readme-typing-svg.demolab.com?font=Share+Tech+Mono&size=18&duration=2500&pause=700&color=00FF41&center=true&vCenter=true&repeat=true&width=850&height=45&lines=%5BBOOT%5D+KernelPolicyGuard+Loaded;%5B*%5D+Attaching+fprobes...;%5B*%5D+Attaching+kprobes...;%5B*%5D+Loading+Policy+Engine...;%5B*%5D+Initializing+NUMA+Workqueues...;%5BREADY%5D+Production+Mode+Active." />
 
